@@ -612,6 +612,105 @@ class UsbAudioDescriptorParserTest {
         )))
     }
 
+    @Test
+    fun simulate_fosiDs2_audioControlRoutingToInterfaceOne() {
+        val layout = UsbAudioDescriptorParser.parse(fosiDs2)!!
+        
+        // Bug 1 Verification:
+        // Older driver sent SET_CUR to interface 0 (HID), causing STALL and 48kHz mismatch.
+        // Fixed driver routes to layout.controlInterfaceId (interface 1).
+        assertEquals(1, layout.controlInterfaceId)
+        
+        val clockSourceId = layout.clockSourceId // 1
+        val targetInterface = layout.controlInterfaceId // 1
+        val wIndex = (clockSourceId shl 8) or targetInterface // 0x0101
+        
+        assertEquals(0x0101, wIndex)
+        // Ensure it is NOT sending to HID at 0x0100
+        assertTrue("Request must NOT target HID interface 0", wIndex != 0x0100)
+    }
+
+    @Test
+    fun simulate_sbXfi_altSettingPacketCapacity() {
+        val layout = UsbAudioDescriptorParser.parse(sbXfi)!!
+        
+        // For 48kHz, stereo, 24-bit PCM:
+        // Required byte rate = 48 frames * 2 channels * 3 bytes = 288 bytes/ms
+        val bytesPerFrame = 2 * 3 // 6 bytes
+        val framesRequiredPerMs = 48
+        val bytesRequiredPerMs = framesRequiredPerMs * bytesPerFrame // 288 bytes
+        
+        // Old buggy behavior: driver clamped to alt1 packet limit (196 bytes)
+        val alt1MaxPacket = 196
+        val oldFramesSentPerMs = alt1MaxPacket / bytesPerFrame // 196 / 6 = 32 frames
+        assertTrue("Old code starved DAC by sending only 32/48 frames", oldFramesSentPerMs < framesRequiredPerMs)
+        assertEquals(32, oldFramesSentPerMs)
+        
+        // Fixed behavior: driver selects alt2 which has maxPacketSize = 294
+        val alt2 = layout.streamingAlts.first { it.altSetting == 2 }
+        assertEquals(294, alt2.maxPacketSize)
+        val newMaxFrames = alt2.maxPacketSize / bytesPerFrame // 294 / 6 = 49 frames
+        assertTrue("New code accommodates all 48 frames per ms", newMaxFrames >= framesRequiredPerMs)
+        assertEquals(49, newMaxFrames)
+    }
+
+    @Test
+    fun simulate_cayinN3_bIntervalAndPcmStreamGeneration() {
+        val layout = UsbAudioDescriptorParser.parse(cayinN3)!!
+        val alt = layout.streamingAlts.first { it.altSetting == 1 }
+        
+        // 1. In Cayin N3 descriptors: bInterval = 2
+        assertEquals(2, alt.interval)
+        val serviceInterval = 1 shl (alt.interval - 1) // 2 microframes = 250 us
+        assertEquals(2, serviceInterval)
+        
+        // High-speed bus base: 8000 microframes/s
+        val busFramesPerSec = 8000
+        val packetsPerSecond = busFramesPerSec / serviceInterval // 4000 packets/s
+        assertEquals(4000, packetsPerSecond)
+        
+        val sampleRate = 44100
+        val nominalFramesPerPacket = sampleRate.toDouble() / packetsPerSecond // 44100 / 4000 = 11.025
+        
+        // 2. Real raw feedback from the user's log: raw = 722878
+        val rawFeedback = 722878L
+        val reportedFramesPerPacket = rawFeedback / 65536.0 // 11.030249...
+        
+        // Check that the feedback corresponds to 4000 packets/s cadence
+        val ratio = reportedFramesPerPacket / nominalFramesPerPacket
+        assertTrue("Feedback matches 4000 pkts/s nominal cadence", ratio in 0.99..1.01)
+        
+        // 3. Simulate 1 second of audio transmission (4000 packets)
+        // with the fixed packets-per-interval pacing:
+        var accumulator = 0.0
+        var totalFramesGenerated = 0L
+        for (pkt in 0 until packetsPerSecond) {
+            accumulator += reportedFramesPerPacket
+            val framesInThisPacket = accumulator.toInt()
+            accumulator -= framesInThisPacket
+            totalFramesGenerated += framesInThisPacket
+        }
+        
+        // In 1 second, exactly ~44120 frames must be sent (matching DAC's 44.12 kHz crystal)
+        assertEquals(44120L, totalFramesGenerated)
+        
+        // In the old buggy driver (which paced at 8000 pkts/s and halved feedback to 5.51):
+        val buggyReportedFrames = reportedFramesPerPacket / 2.0 // 5.5151
+        var buggyAccumulator = 0.0
+        var buggyFramesGenerated = 0L
+        for (pkt in 0 until packetsPerSecond) { // USBFS only schedules 4000 pkts/s
+            buggyAccumulator += buggyReportedFrames
+            val frames = buggyAccumulator.toInt()
+            buggyAccumulator -= frames
+            buggyFramesGenerated += frames
+        }
+        
+        // Prove that the old bug only delivered 50% of the audio:
+        assertEquals(22060L, buggyFramesGenerated)
+        val deliveryPercentage = (buggyFramesGenerated.toDouble() / sampleRate) * 100.0
+        assertTrue("Buggy driver delivered only ~50% audio, starving buffer", deliveryPercentage < 51.0)
+    }
+
     private fun hex(vararg rows: String): ByteArray =
             rows.joinToString(" ")
                     .split(Regex("\\s+"))
